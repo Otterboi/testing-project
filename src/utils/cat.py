@@ -17,7 +17,7 @@ class Cat:
     
     def eat_with_me(self, food: str) -> str:
         """Feed the cat."""
-        meow()
+        self.meow()
         if self.hungry:
             self.hungry = False
             return f"{self.name} happily eats the {food}."
