@@ -1,4 +1,4 @@
-from favorite_fruit import get_user_favorite_fruit
+from fruits import get_user_favorite_fruit
 
 # Test the get_user_favorite_fruit function
 user_name = "Alice"  # Example user name
