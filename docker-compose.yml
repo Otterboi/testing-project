@@ -1,0 +1,325 @@
+#version: "3.9"
+
+services:
+  # --- MongoDB ---
+  mongo:
+    image: mongo:6.0
+    container_name: scribe_mongo
+    environment:
+      - MONGO_DB_ROOT_USERNAME=${MONGO_DB_USERNAME}
+      - MONGO_DB_ROOT_PASSWORD=${MONGO_DB_PASSWORD}
+      - MONGO_DB_DATABASENAME=${MONGO_DB_DATABASE}
+    ports: # this port is greater than the default one to prevent any conflicts
+      - "27117:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- Keycloak DB ---
+  keycloak_db:
+    image: postgres:16
+    container_name: scribe_keycloak_db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${KC_DB_NAME}
+      - POSTGRES_USER=${KC_DB_USER}
+      - POSTGRES_PASSWORD=${KC_DB_PASSWORD}
+    volumes:
+      - keycloak_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # --- Keycloak ---
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: scribe_keycloak
+    depends_on:
+      keycloak_db:
+        condition: service_healthy
+    volumes:
+      - ./keycloak/import:/opt/keycloak/data/import
+    environment:
+      - KEYCLOAK_ADMIN=${KEYCLOAK_ADMIN}
+      - KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD}
+      - KC_DB=postgres
+      - KC_DB_URL=jdbc:postgresql://keycloak_db:5432/${KC_DB_NAME}
+      - KC_DB_USERNAME=${KC_DB_USER}
+      - KC_DB_PASSWORD=${KC_DB_PASSWORD}
+      - KC_HTTP_ENABLED=true
+      - KC_PROXY=edge
+      - KC_PROXY_ADDRESS_FORWARDING=true
+      - KC_HOSTNAME_STRICT_HTTPS=true
+      - KC_HOSTNAME=https://localhost
+      - KC_HOSTNAME_URL=https://localhost
+      - KC_HOSTNAME_ADMIN_URL=https://localhost
+      - KC_HOSTNAME_STRICT=false
+      - KC_REALM=${KC_REALM}
+      - GIT_OAUTH_CLIENT_ID=${GIT_OAUTH_CLIENT_ID}
+      - GIT_OAUTH_CLIENT_SECRET=${GIT_OAUTH_CLIENT_SECRET}
+    command: ["start-dev", "--import-realm"]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          '/opt/keycloak/bin/kcadm.sh config credentials --server http://localhost:8080 --realm master --user "$KEYCLOAK_ADMIN" --password "$KEYCLOAK_ADMIN_PASSWORD" >/dev/null 2>&1 && /opt/keycloak/bin/kcadm.sh get realms/"$KC_REALM" >/dev/null 2>&1',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # --- Keycloak Init ---
+  keycloak_init:
+    image: quay.io/keycloak/keycloak:26.0
+    depends_on:
+      mongo:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    environment:
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KC_REALM: ${KC_REALM}
+      DEV_USERNAME: ${KC_DEV_USERNAME}
+      DEV_EMAIL: ${KC_DEV_EMAIL}
+      DEV_PASSWORD: ${KC_DEV_PASSWORD}
+      KC_BASE: ${KC_BASE:-http://keycloak:8080}
+      GIT_OAUTH_CLIENT_ID: ${GIT_OAUTH_CLIENT_ID}
+      GIT_OAUTH_CLIENT_SECRET: ${GIT_OAUTH_CLIENT_SECRET}
+      GIT_TRUST_EMAIL: ${GIT_TRUST_EMAIL:-false}
+      GIT_STORE_TOKEN: ${GIT_STORE_TOKEN:-false}
+      GIT_DEFAULT_SCOPE: ${GIT_DEFAULT_SCOPE:-read:user user:email}
+    volumes:
+      - ./keycloak/init:/opt/init:ro
+    entrypoint: ["/bin/sh", "-c", "sh /opt/init/init-keycloak.sh"]
+    restart: "no"
+
+  # --- Certificate Generator (Init Container) ---
+  cert-generator:
+    image: alpine:latest
+    container_name: scribe_cert_generator
+    volumes:
+      - nginx_certs:/certs
+    command: |
+      sh -c "
+        if [ ! -f /certs/localhost.pem ]; then
+          echo 'Generating development certificates for HTTPS...'
+          apk add --no-cache openssl
+          cat > /tmp/openssl.conf << EOF
+      [req]
+      distinguished_name = req_distinguished_name
+      req_extensions = v3_req
+      prompt = no
+
+      [req_distinguished_name]
+      C = US
+      ST = Dev
+      L = Local
+      O = ScribePilot
+      CN = localhost
+
+      [v3_req]
+      subjectAltName = DNS:localhost,IP:127.0.0.1
+      EOF
+          openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /certs/localhost-key.pem -out /certs/localhost.pem -config /tmp/openssl.conf -extensions v3_req
+          echo '✅ HTTPS certificates generated'
+        else
+          echo 'HTTPS certificates already exist'
+        fi
+      "
+    restart: "no"
+
+  # --- Nginx Reverse Proxy ---
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: scribe_nginx
+    depends_on:
+      cert-generator:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    ports:
+      - "80:80" # HTTP (redirects to HTTPS)
+      - "443:443" # HTTPS (main entry point)
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx_certs:/etc/nginx/certs:ro
+      - nginx_logs:/var/log/nginx
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -k -f https://localhost/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # --- pgvector ---
+  pgvector:
+    image: pgvector/pgvector:pg16
+    container_name: scribe_pgvector_db
+    environment:
+      POSTGRES_USER: ${VDB_USERNAME}
+      POSTGRES_PASSWORD: ${VDB_PASSWORD}
+      POSTGRES_DB: ${VDB_DATABASE}
+      PGPORT: 5433
+    ports:
+      - "5433:5433"
+    volumes:
+      - pgvector_data:/var/lib/postgresql/data
+      - ./backend/VectorDB/pgvector_init.sql:/docker-entrypoint-initdb.d/pgvector_init.sql
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -p 5433"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # --- PgAdmin ---
+  pgadmin:
+    image: dpage/pgadmin4
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PG_ADMIN_USER}
+      PGADMIN_DEFAULT_PASSWORD: ${PG_ADMIN_PASSWORD}
+    ports:
+      - "5434:80"
+    depends_on:
+      - pgvector
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+  # --- Elasticsearch ----
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: scribe_elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test:
+        ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # --- Kibana ---
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: scribe_kibana
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=${XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY}
+
+    ports:
+      - "5601:5601"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5601/api/status || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # --- Backend ---
+  backend:
+    build: ./backend
+    container_name: scribe_backend
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      pgvector:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    working_dir: /app
+    environment:
+      - MONGO_URI=${MONGO_URI}
+      - OIDC_ISSUER=${OIDC_ISSUER}
+      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID}
+      - OIDC_AUDIENCE=${OIDC_AUDIENCE}
+      - OIDC_JWKS_URI=${OIDC_JWKS_URI}
+      - KC_BASE=http://keycloak:8080
+      - KC_REALM=${KC_REALM}
+      - KEYCLOAK_ADMIN=${KEYCLOAK_ADMIN}
+      - KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD}
+      - VDB_USERNAME=${VDB_USERNAME}
+      - VDB_PASSWORD=${VDB_PASSWORD}
+      - VDB_DATABASE=${VDB_DATABASE}
+      - PYTHONPATH=/app
+      - OLLAMA_API_KEY=${OLLAMA_API_KEY}
+      - RBAC_IMPORT_TOKEN=${RBAC_IMPORT_TOKEN}
+      - ELASTICSEARCH_HOST=http://elasticsearch:9200
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=${XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY}
+    volumes:
+      - ./backend:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --proxy-headers --forwarded-allow-ips="*"
+  # --- SonarQube DB ---
+  sonarqube_db:
+    image: postgres:15
+    container_name: scribe_sonarqube_db
+    environment:
+      - POSTGRES_USER=sonar
+      - POSTGRES_PASSWORD=sonar
+      - POSTGRES_DB=sonarqube
+    volumes:
+      - sonarqube_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- SonarQube ---
+  sonarqube:
+    image: sonarqube:community
+    container_name: scribe_sonarqube
+    depends_on:
+      sonarqube_db:
+        condition: service_started
+    environment:
+      - SONAR_JDBC_URL=jdbc:postgresql://sonarqube_db:5432/sonarqube
+      - SONAR_JDBC_USERNAME=sonar
+      - SONAR_JDBC_PASSWORD=sonar
+    ports:
+      - "9000:9000"
+    volumes:
+      - sonarqube_data:/opt/sonarqube/data
+      - sonarqube_logs:/opt/sonarqube/logs
+      - sonarqube_extensions:/opt/sonarqube/extensions
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --no-verbose --tries=1 --spider http://localhost:9000/api/system/health || exit 1",
+        ]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 60s
+
+volumes:
+  mongo_data:
+  keycloak_pg_data:
+  pgvector_data:
+  pgadmin_data:
+  sonarqube_db_data:
+  sonarqube_data:
+  sonarqube_logs:
+  sonarqube_extensions:
+  nginx_certs:
+  nginx_logs:
+  elasticsearch_data:

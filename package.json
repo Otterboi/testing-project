@@ -1,0 +1,115 @@
+{
+  "name": "scribepilot",
+  "publisher": "scribe",
+  "displayName": "ScribePilot",
+  "description": "ai-coding-assistant",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.104.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onUri",
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "scribepilot",
+          "title": "ScribePilot",
+          "icon": "$(comment-discussion)"
+        }
+      ]
+    },
+    "views": {
+      "scribepilot": [
+        {
+          "type": "webview",
+          "id": "scribepilotView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "scribepilot.hello",
+        "title": "ScribePilot: Say Hello"
+      },
+      {
+        "command": "scribepilot.focusChat",
+        "title": "ScribePilot: Focus Chat (Sidebar)"
+      },
+      {
+        "command": "scribepilot.testProtectedEndpoint",
+        "title": "ScribePilot: Test /me Endpoint"
+      },
+      {
+        "command": "scribepilot.indexWorkspace",
+        "title": "ScribePilot: Index Workspace"
+      },
+      {
+        "command": "scribepilot.showCurrentContext",
+        "title": "ScribePilot: Show Current Context"
+      }
+    ],
+    "uriHandlers": [
+      {
+        "authority": "scribe.scribepilot"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "npm run check-types && npm run lint && node esbuild.js",
+    "watch": "npm-run-all -p watch:*",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+    "package": "npm run check-types && npm run lint && node esbuild.js --production",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src --ext .ts,.js",
+    "lint:fix": "eslint src --ext .ts,.js --fix",
+    "test": "npm run test:ts && npm run test:js",
+    "test:ts": "npx tsx src/test/index.ts",
+    "test:js": "jest",
+    "test:mocha": "npm run test:ts",
+    "test:jest": "npm run test:js",
+    "test:jest:watch": "jest --watch",
+    "coverage": "npm run coverage:mocha && npm run coverage:jest",
+    "coverage:mocha": "nyc npm run test:mocha",
+    "coverage:jest": "jest --coverage",
+    "coverage:combined": "npm run coverage:mocha && npm run coverage:jest && node scripts/merge-coverage.js"
+  },
+  "devDependencies": {
+    "@istanbuljs/nyc-config-typescript": "^1.0.2"
+  },
+  "nyc": {
+    "extension": [
+      ".ts",
+      ".tsx"
+    ],
+    "include": [
+      "src/**/*.ts"
+    ],
+    "exclude": [
+      "src/test/**/*.ts",
+      "src/extension.ts",
+      "src/commands.ts"
+    ],
+    "require": [
+      "ts-node/register",
+      "source-map-support/register"
+    ],
+    "reporter": [
+      "text",
+      "lcov"
+    ],
+    "all": true
+  }
+}
