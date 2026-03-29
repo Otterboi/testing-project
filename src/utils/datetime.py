@@ -15,7 +15,3 @@ def utcnow() -> datetime:
         Current UTC datetime with timezone info
     """
     return datetime.now(timezone.utc)
-
-# scribe: a function that adds 2 numbers
-def add_numbers(a, b):
-    return a + b
